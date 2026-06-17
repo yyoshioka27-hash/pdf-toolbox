@@ -14,8 +14,9 @@ import fitz  # PyMuPDF
 import streamlit as st
 
 
-THUMBNAIL_ZOOM = 0.22
-THUMBNAIL_MAX_BYTES = 350_000
+THUMBNAIL_ZOOM = 0.34
+THUMBNAIL_FALLBACK_ZOOM = 0.20
+THUMBNAIL_MAX_BYTES = 450_000
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,7 @@ def _make_thumbnail(page: PageRef, sources: dict[str, PdfSource]) -> bytes | Non
             png = pixmap.tobytes("png")
             if len(png) > THUMBNAIL_MAX_BYTES:
                 pixmap = doc.load_page(page.page_index).get_pixmap(
-                    matrix=fitz.Matrix(0.16, 0.16),
+                    matrix=fitz.Matrix(THUMBNAIL_FALLBACK_ZOOM, THUMBNAIL_FALLBACK_ZOOM),
                     alpha=False,
                 )
                 png = pixmap.tobytes("png")
@@ -128,7 +129,8 @@ def _reset_editor(source_id: str, source: PdfSource, pages: list[PageRef]) -> No
     st.session_state.sources = {source_id: source}
     st.session_state.pages = pages
     st.session_state.deleted_pages = set()
-    st.session_state.order_text = ",".join(str(i) for i in range(1, len(pages) + 1))
+    _bump_list_version()
+    _sync_order_text()
 
 
 def _ensure_state() -> None:
@@ -136,6 +138,42 @@ def _ensure_state() -> None:
     st.session_state.setdefault("pages", [])
     st.session_state.setdefault("deleted_pages", set())
     st.session_state.setdefault("order_text", "")
+    st.session_state.setdefault("list_version", 0)
+
+
+def _sync_order_text() -> None:
+    st.session_state.order_text = ",".join(str(i) for i in range(1, len(st.session_state.pages) + 1))
+
+
+def _bump_list_version() -> None:
+    st.session_state.list_version += 1
+
+
+def _insert_pdf_at(uploaded_file, after_page_number: int) -> bool:
+    if uploaded_file is None:
+        st.warning("挿入するPDFを先にアップロードしてください。")
+        return False
+
+    if not st.session_state.pages:
+        st.warning("挿入先のPDFを先にアップロードしてください。")
+        return False
+
+    try:
+        source_id, source, insert_pages = _read_pdf(uploaded_file)
+    except ValueError as exc:
+        st.error(str(exc))
+        return False
+
+    insert_at = max(0, min(after_page_number, len(st.session_state.pages)))
+    st.session_state.sources[source_id] = source
+    st.session_state.pages = (
+        st.session_state.pages[:insert_at] + insert_pages + st.session_state.pages[insert_at:]
+    )
+    st.session_state.deleted_pages = set()
+    _bump_list_version()
+    _sync_order_text()
+    st.success(f"{source.name} の {source.page_count} ページを {insert_at} ページ目の後ろに挿入しました。")
+    return True
 
 
 def _move_page(index: int, direction: int) -> None:
@@ -144,7 +182,9 @@ def _move_page(index: int, direction: int) -> None:
     if 0 <= index < len(pages) and 0 <= new_index < len(pages):
         pages[index], pages[new_index] = pages[new_index], pages[index]
         st.session_state.pages = pages
-        st.session_state.order_text = ",".join(str(i) for i in range(1, len(pages) + 1))
+        st.session_state.deleted_pages = set()
+        _bump_list_version()
+        _sync_order_text()
 
 
 def _apply_order(order_text: str) -> None:
@@ -161,7 +201,9 @@ def _apply_order(order_text: str) -> None:
         return
 
     st.session_state.pages = [pages[number - 1] for number in order]
-    st.session_state.order_text = ",".join(str(i) for i in range(1, len(pages) + 1))
+    st.session_state.deleted_pages = set()
+    _bump_list_version()
+    _sync_order_text()
     st.success("ページ順を更新しました。")
 
 
@@ -173,11 +215,12 @@ def _delete_selected() -> None:
 
     st.session_state.pages = [page for index, page in enumerate(st.session_state.pages) if index not in selected]
     st.session_state.deleted_pages = set()
-    st.session_state.order_text = ",".join(str(i) for i in range(1, len(st.session_state.pages) + 1))
-    st.success("選択したページを削除しました。")
+    _bump_list_version()
+    _sync_order_text()
+    st.success("選択したページを削除しました。ページ番号を振り直しました。")
 
 
-def _render_page_list() -> None:
+def _render_page_list(additional_pdf=None) -> None:
     pages: list[PageRef] = st.session_state.pages
     sources: dict[str, PdfSource] = st.session_state.sources
 
@@ -189,7 +232,7 @@ def _render_page_list() -> None:
 
     for index, page in enumerate(pages):
         with st.container(border=True):
-            cols = st.columns([1.4, 2.2, 1.2, 1.2, 1.4])
+            cols = st.columns([2.4, 2.4, 1.0, 1.0, 1.2, 1.7])
             thumbnail = _cached_thumbnail(
                 page.source_id,
                 page.source_name,
@@ -202,7 +245,10 @@ def _render_page_list() -> None:
                 else:
                     st.warning("サムネイルを表示できません。")
             with cols[1]:
-                st.markdown(f"### ページ {index + 1}")
+                st.markdown(
+                    f"<div style='font-size:2.2rem;font-weight:800;'>ページ {index + 1}</div>",
+                    unsafe_allow_html=True,
+                )
                 st.write(f"元ファイル: {page.source_name}")
                 st.write(f"元ページ: {page.original_page_number}")
             with cols[2]:
@@ -214,11 +260,19 @@ def _render_page_list() -> None:
                     _move_page(index, 1)
                     st.rerun()
             with cols[4]:
-                checked = st.checkbox("削除対象", key=f"delete_{index}")
+                checked = st.checkbox("削除対象", key=f"delete_{st.session_state.list_version}_{index}")
                 if checked:
                     st.session_state.deleted_pages.add(index)
                 else:
                     st.session_state.deleted_pages.discard(index)
+            with cols[5]:
+                if st.button(
+                    "ここにPDFを挿入",
+                    key=f"insert_after_{index}",
+                    help="このページの後ろに追加PDFを挿入します",
+                ):
+                    if _insert_pdf_at(additional_pdf, index + 1):
+                        st.rerun()
 
 
 def main() -> None:
@@ -238,25 +292,49 @@ def main() -> None:
         except ValueError as exc:
             st.error(str(exc))
 
+    st.header("PDF挿入")
+    additional_pdf = st.file_uploader(
+        "挿入する別PDFをアップロードしてください",
+        type=["pdf"],
+        key="additional_pdf",
+        help="アップロード後、挿入位置を選ぶか、ページ一覧の各ページにあるボタンで挿入できます。",
+    )
+
+    if st.session_state.pages:
+        insert_after = st.selectbox(
+            "何ページ目の後ろに挿入しますか（0 は先頭）",
+            options=list(range(0, len(st.session_state.pages) + 1)),
+            format_func=lambda value: "0：先頭に挿入" if value == 0 else f"{value}ページ目の後ろに挿入",
+            disabled=additional_pdf is None,
+        )
+        if st.button("指定位置にPDFを挿入", disabled=additional_pdf is None):
+            if _insert_pdf_at(additional_pdf, insert_after):
+                st.rerun()
+    else:
+        st.info("挿入機能を使うには、先に編集するPDFをアップロードしてください。")
+
     st.header("ページ一覧")
-    _render_page_list()
+    if st.session_state.pages and additional_pdf is not None:
+        if st.button("先頭にPDFを挿入", help="追加PDFを現在の1ページ目の前に挿入します"):
+            if _insert_pdf_at(additional_pdf, 0):
+                st.rerun()
+    _render_page_list(additional_pdf)
 
     st.header("ページ削除")
-    st.write("ページ一覧の「削除対象」にチェックを入れてから削除してください。")
-    st.button("選択したページを削除", on_click=_delete_selected, disabled=not st.session_state.pages)
-
-    st.header("PDF追加")
-    additional_pdf = st.file_uploader("末尾に追加するPDFをアップロードしてください", type=["pdf"], key="additional_pdf")
-    if additional_pdf is not None and st.button("PDFを末尾に追加"):
-        try:
-            source_id, source, pages = _read_pdf(additional_pdf)
-            st.session_state.sources[source_id] = source
-            st.session_state.pages.extend(pages)
-            st.session_state.order_text = ",".join(str(i) for i in range(1, len(st.session_state.pages) + 1))
-            st.success(f"{source.name} の {source.page_count} ページを末尾に追加しました。")
+    st.write("ページ一覧の「削除対象」にチェックを入れると、ここに確認メッセージが表示されます。")
+    selected_count = len(st.session_state.deleted_pages)
+    if selected_count:
+        selected_numbers = ", ".join(str(index + 1) for index in sorted(st.session_state.deleted_pages))
+        st.warning(
+            f"{selected_count}ページを削除します（ページ: {selected_numbers}）。"
+            "この操作はダウンロード前の編集状態からページを取り除きます。"
+        )
+        confirmed = st.checkbox("確認しました。選択ページを削除します。", key="confirm_delete")
+        if st.button("選択ページを削除", type="primary", disabled=not confirmed):
+            _delete_selected()
             st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
+    else:
+        st.button("選択ページを削除", disabled=True)
 
     st.header("ページ並び替え")
     st.write("ページ一覧の「上へ」「下へ」ボタンで移動できます。まとめて変更する場合はページ順を入力してください。")
